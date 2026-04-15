@@ -80,10 +80,16 @@ REGIME_TICKERS = ["SPY", "HYG", "IEF", "^VIX", "^VIX3M"]
 
 # ── Treasury Yield Curve ──────────────────────────────────────────────────────
 
+def _strip_ns(tag: str) -> str:
+    """Strip XML namespace from a tag string."""
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
 def fetch_treasury_curve(year: int, month: int) -> dict[str, float]:
     """
     Fetch the most recent daily treasury yield curve for the given year/month
     from the US Treasury's public XML API. Returns {field_name: yield_pct}.
+    Uses namespace-stripped parsing for robustness against API changes.
     """
     url = (
         "https://home.treasury.gov/resource-center/data-chart-center/"
@@ -97,37 +103,44 @@ def fetch_treasury_curve(year: int, month: int) -> dict[str, float]:
         log.warning(f"Treasury API failed for {year}-{month:02d}: {e}")
         return {}
 
-    D_NS = "http://schemas.microsoft.com/ado/2007/08/dataservices"
-    M_NS = "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
-    A_NS = "http://www.w3.org/2005/Atom"
+    valid_fields = {f for f, _, _ in TREASURY_FIELDS}
 
-    root = ET.fromstring(resp.content)
-    entries = []
-    for entry in root.iter(f"{{{A_NS}}}entry"):
-        props = entry.find(f".//{{{M_NS}}}properties")
-        if props is None:
-            continue
-        row: dict[str, float] = {}
-        for field, _label, _mat in TREASURY_FIELDS:
-            el = props.find(f"{{{D_NS}}}{field}")
-            if el is not None and el.text and el.text.strip():
-                try:
-                    row[field] = float(el.text)
-                except ValueError:
-                    pass
-        date_el = props.find(f"{{{D_NS}}}NEW_DATE")
-        if date_el is not None and date_el.text:
-            row["_date"] = date_el.text[:10]
-        if len(row) > 1:
-            entries.append(row)
+    try:
+        root    = ET.fromstring(resp.content)
+        entries = []
 
-    if not entries:
-        log.warning(f"No treasury data found for {year}-{month:02d}")
+        # Walk entire tree looking for 'properties' elements (namespace-agnostic)
+        for elem in root.iter():
+            if _strip_ns(elem.tag) != "properties":
+                continue
+            row: dict[str, float] = {}
+            for child in elem:
+                tag = _strip_ns(child.tag)
+                text = (child.text or "").strip()
+                if not text or text in (".", "null", ""):
+                    continue
+                if tag == "NEW_DATE":
+                    row["_date"] = text[:10]
+                elif tag in valid_fields:
+                    try:
+                        row[tag] = float(text)
+                    except ValueError:
+                        pass
+            if len(row) > 2:          # date + at least 2 yield points
+                entries.append(row)
+
+        if not entries:
+            log.warning(f"No treasury data parsed for {year}-{month:02d}")
+            return {}
+
+        entries.sort(key=lambda x: x.get("_date", ""), reverse=True)
+        result = entries[0]
+        log.info(f"Treasury {year}-{month:02d}: {len(result)-1} points, date={result.get('_date')}")
+        return result
+
+    except Exception as e:
+        log.warning(f"Treasury XML parse error for {year}-{month:02d}: {e}")
         return {}
-
-    # Return most recent day in the month
-    entries.sort(key=lambda x: x.get("_date", ""), reverse=True)
-    return entries[0]
 
 
 def get_treasury_curves() -> dict[str, dict]:
@@ -146,86 +159,92 @@ def get_treasury_curves() -> dict[str, dict]:
 
 # ── Futures Term Structures ───────────────────────────────────────────────────
 
-def futures_symbols(prefix: str, ref_date: datetime, n: int = 12) -> list[tuple[str, str]]:
+def futures_symbols(prefix: str, ref_date: datetime, n: int = 12) -> list[tuple[list[str], str]]:
     """
     Generate n monthly futures contract symbols starting the month after ref_date.
-    Returns list of (symbol, label) tuples.
+    Returns list of ([candidate_symbols], label) — multiple formats tried per month.
     """
-    results = []
+    # Exchange suffix map for known prefixes
+    exchange = {"CL": "NYM", "BZ": "NYM"}.get(prefix, "")
+    results  = []
     for i in range(1, n + 1):
-        # Advance i months from ref_date
         month = ref_date.month + i
         year  = ref_date.year
         while month > 12:
             month -= 12
             year  += 1
-        code   = MONTH_CODES[month]
-        symbol = f"{prefix}{code}{str(year)[-2:]}=F"
-        label  = datetime(year, month, 1).strftime("%b %y")
-        results.append((symbol, label))
+        code  = MONTH_CODES[month]
+        yr2   = str(year)[-2:]
+        label = datetime(year, month, 1).strftime("%b %y")
+
+        candidates = [
+            f"{prefix}{code}{yr2}=F",            # CLK26=F   (most common yfinance)
+            f"{prefix}{code}{yr2}.{exchange}",    # CLK26.NYM
+            f"{prefix}{code}{year}.{exchange}",   # CLK2026.NYM
+        ]
+        results.append((candidates, label))
     return results
 
 
-def fetch_futures_curve(
-    prefix: str,
-    ref_date: datetime,
-    prices_df: pd.DataFrame | None = None,
-) -> dict[str, dict]:
+def _download_with_fallback(candidates: list[str], start: str, end: str) -> pd.Series:
+    """
+    Try each candidate symbol until one returns data. Returns a Close price series.
+    """
+    for sym in candidates:
+        try:
+            raw = yf.download(sym, start=start, end=end,
+                              auto_adjust=True, progress=False)
+            if raw.empty:
+                continue
+            s = raw["Close"].dropna() if "Close" in raw.columns else pd.Series(dtype=float)
+            if not s.empty:
+                log.info(f"  {sym}: {len(s)} rows")
+                return s
+        except Exception:
+            pass
+    return pd.Series(dtype=float)
+
+
+def fetch_futures_curve(prefix: str, ref_date: datetime) -> dict[str, dict]:
     """
     Build futures term structure curves (current, 1M ago, 1Y ago).
-    Downloads historical data for each contract and samples at the target dates.
+    Tries multiple symbol formats per contract month for reliability.
     """
     symbols = futures_symbols(prefix, ref_date, n=12)
-    tickers = [s for s, _ in symbols]
-    labels  = [l for _, l in symbols]
+    log.info(f"Fetching {prefix} futures term structure ({len(symbols)} months)...")
 
-    log.info(f"Downloading {prefix} futures: {tickers[:3]}...{tickers[-1]}")
+    end_str   = ref_date.strftime("%Y-%m-%d")
+    start_str = (ref_date - timedelta(days=400)).strftime("%Y-%m-%d")
 
-    end   = ref_date
-    start = ref_date - timedelta(days=400)
-
-    try:
-        raw = yf.download(
-            tickers,
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-        )
-    except Exception as e:
-        log.error(f"Failed to download {prefix} futures: {e}")
-        return {}
-
-    def price_on(ticker: str, target: datetime) -> float | None:
-        try:
-            if isinstance(raw.columns, pd.MultiIndex):
-                if ticker in raw.columns.get_level_values(0):
-                    series = raw[ticker]["Close"]
-                else:
-                    series = raw.xs(ticker, level=1, axis=1)["Close"]
-            else:
-                series = raw["Close"]
-            series = series.dropna()
-            if series.empty:
-                return None
-            return float(series.asof(target))
-        except Exception:
-            return None
-
-    t_now  = ref_date
-    t_1m   = ref_date - timedelta(days=21)
-    t_1y   = ref_date - timedelta(days=252)
+    t_now = ref_date
+    t_1m  = ref_date - timedelta(days=21)
+    t_1y  = ref_date - timedelta(days=252)
 
     curves: dict[str, dict] = {"current": {}, "1m_ago": {}, "1y_ago": {}}
-    for ticker, label in zip(tickers, labels):
-        p_now = price_on(ticker, t_now)
-        p_1m  = price_on(ticker, t_1m)
-        p_1y  = price_on(ticker, t_1y)
+
+    for candidates, label in symbols:
+        series = _download_with_fallback(candidates, start_str, end_str)
+        if series.empty:
+            log.debug(f"  No data for {label} ({candidates[0]})")
+            continue
+
+        def asof_price(s: pd.Series, dt: datetime) -> float | None:
+            try:
+                v = s.asof(dt)
+                return float(v) if v == v else None
+            except Exception:
+                return None
+
+        p_now = asof_price(series, t_now)
+        p_1m  = asof_price(series, t_1m)
+        p_1y  = asof_price(series, t_1y)
+
         if p_now: curves["current"][label] = p_now
         if p_1m:  curves["1m_ago"][label]  = p_1m
         if p_1y:  curves["1y_ago"][label]  = p_1y
 
+    log.info(f"{prefix} curve points — current:{len(curves['current'])} "
+             f"1m:{len(curves['1m_ago'])} 1y:{len(curves['1y_ago'])}")
     return curves
 
 
@@ -233,18 +252,39 @@ def fetch_futures_curve(
 
 def get_vix_term_structure(prices: pd.DataFrame) -> dict[str, dict]:
     """
-    Build VIX term structure from ^VIX (30d) and ^VIX3M (93d).
+    Build VIX term structure.
+    Uses ^VIX (30d), ^VIX3M (93d) where available.
+    If ^VIX3M is missing, downloads it separately.
     Samples current, 1M ago, and 1Y ago from historical data.
     """
-    labels = ["30d (VIX)", "93d (VIX3M)"]
-    tickers = ["^VIX", "^VIX3M"]
-
     curves: dict[str, dict] = {"current": {}, "1m_ago": {}, "1y_ago": {}}
-    for ticker, label in zip(tickers, labels):
-        if ticker not in prices.columns:
-            continue
-        s = prices[ticker].dropna()
-        if s.empty:
+
+    # Try to get ^VIX3M if not already in prices
+    vix3m_series = None
+    if "^VIX3M" not in prices.columns or prices["^VIX3M"].dropna().empty:
+        log.info("^VIX3M not in main download — fetching separately...")
+        try:
+            end   = datetime.today()
+            start = end - timedelta(days=400)
+            raw   = yf.download("^VIX3M", start=start.strftime("%Y-%m-%d"),
+                                end=end.strftime("%Y-%m-%d"),
+                                auto_adjust=True, progress=False)
+            if not raw.empty and "Close" in raw.columns:
+                vix3m_series = raw["Close"].dropna()
+                log.info(f"^VIX3M: {len(vix3m_series)} rows")
+        except Exception as e:
+            log.warning(f"^VIX3M fetch failed: {e}")
+    else:
+        vix3m_series = prices["^VIX3M"].dropna()
+
+    tenor_map = [
+        ("30d (VIX)",   prices.get("^VIX", pd.Series(dtype=float)).dropna()),
+        ("93d (VIX3M)", vix3m_series if vix3m_series is not None else pd.Series(dtype=float)),
+    ]
+
+    for label, s in tenor_map:
+        if s is None or s.empty:
+            log.warning(f"No data for {label}")
             continue
         n = len(s)
         curves["current"][label] = float(s.iloc[-1])
@@ -253,6 +293,7 @@ def get_vix_term_structure(prices: pd.DataFrame) -> dict[str, dict]:
         if n >= 252:
             curves["1y_ago"][label]  = float(s.iloc[-252])
 
+    log.info(f"VIX curve points — {list(curves['current'].keys())}")
     return curves
 
 
