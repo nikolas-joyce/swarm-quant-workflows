@@ -1,0 +1,42 @@
+name: 04 — Weekly US Macro Dashboard
+
+on:
+  schedule:
+    # Every Monday at 9:45 AM Eastern (13:45 UTC)
+    - cron: '45 13 * * 1'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Gmail token from secret
+        run: echo '${{ secrets.GMAIL_TOKEN_JSON }}' > token.json
+
+      - name: Run Macro Dashboard
+        env:
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          GMAIL_TOKEN_PATH: token.json
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python 04_macro_dashboard/macro_dashboard.py
+
+      - name: Clean up token file
+        if: always()
+        run: rm -f token.json
