@@ -261,7 +261,7 @@ def build_email_html(sector_df: pd.DataFrame, pulse: list[dict]) -> str:
             <div style="color:#94a3b8;font-size:10px;font-weight:600;
                 text-transform:uppercase;letter-spacing:1px;">{p['label']}</div>
             <div style="color:#f8fafc;font-size:18px;font-weight:800;margin:3px 0;">
-              {'': }{p['price']:.2f}
+              {p['price']:.2f}
             </div>
             <div style="color:{ret_color};font-size:12px;font-weight:600;">{ret_str} 1W</div>
           </td>"""
