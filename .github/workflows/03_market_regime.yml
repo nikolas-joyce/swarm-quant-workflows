@@ -1,0 +1,41 @@
+name: 03 — Weekly Market Regime & Term Structure
+
+on:
+  schedule:
+    # Every Monday at 9:30 AM Eastern (13:30 UTC)
+    - cron: '30 13 * * 1'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Gmail token from secret
+        run: echo '${{ secrets.GMAIL_TOKEN_JSON }}' > token.json
+
+      - name: Run Market Regime Report
+        env:
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          GMAIL_TOKEN_PATH: token.json
+        run: python 03_market_regime/market_regime.py
+
+      - name: Clean up token file
+        if: always()
+        run: rm -f token.json
