@@ -1,0 +1,38 @@
+name: 02 — Weekly Sector Rotation Monitor
+
+on:
+  schedule:
+    # Every Monday at 9:15 AM Eastern (14:15 UTC) — 15 min after workflow 01
+    - cron: '15 14 * * 1'
+  workflow_dispatch:
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Gmail token from secret
+        run: echo '${{ secrets.GMAIL_TOKEN_JSON }}' > token.json
+
+      - name: Run Sector Rotation Report
+        env:
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          GMAIL_TOKEN_PATH: token.json
+        run: python 02_sector_rotation/sector_rotation.py
+
+      - name: Clean up token file
+        if: always()
+        run: rm -f token.json
