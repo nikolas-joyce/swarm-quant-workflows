@@ -1,0 +1,39 @@
+name: 01 — Weekly ETF Liquidity Report
+
+on:
+  schedule:
+    # Every Monday at 9:00 AM Eastern (14:00 UTC)
+    - cron: '0 14 * * 1'
+  workflow_dispatch:
+    # Allows manual trigger from the GitHub Actions tab
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Gmail token from secret
+        run: echo '${{ secrets.GMAIL_TOKEN_JSON }}' > token.json
+
+      - name: Run ETF Liquidity Report
+        env:
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          GMAIL_TOKEN_PATH: token.json
+        run: python 01_etf_liquidity_ranker/etf_liquidity_ranker.py
+
+      - name: Clean up token file
+        if: always()
+        run: rm -f token.json
