@@ -78,16 +78,39 @@ SENTIMENT_TICKERS = ["^VIX", "^VVIX", "^SKEW"]
 # CFTC base URL
 CFTC_BASE = "https://www.cftc.gov/files/dea/history"
 
-# COT contracts: (name_fragment, display_label, chart_group, report_type)
+# COT contracts: (name_fragments, display_label, chart_group, report_type)
+#   name_fragments is a LIST — first fragment that matches a row in the file wins.
 #   report_type "tff"    → Traders in Financial Futures, column = Lev_Money (hedge funds/CTAs)
 #   report_type "disagg" → Disaggregated Futures,        column = M_Money   (money managers)
 COT_CONTRACTS = [
-    ("E-MINI S&P 500",         "S&P 500 E-mini",   "equity",    "tff"),
-    ("NASDAQ-100 STOCK INDEX", "Nasdaq 100 E-mini", "equity",    "tff"),
-    ("CBOE VIX",               "VIX Futures",       "equity",    "tff"),
-    ("10-YEAR U.S. TREASURY",  "10Y T-Note",        "rates",     "tff"),
-    ("GOLD - COMMODITY",       "Gold",              "commodity", "disagg"),
-    ("CRUDE OIL, LIGHT SWEET", "WTI Crude",         "commodity", "disagg"),
+    # ── Equity (TFF) ─────────────────────────────────────────────────────────
+    (["E-MINI S&P 500"],
+     "S&P 500 E-mini",   "equity",    "tff"),
+    (["NASDAQ-100 STOCK INDEX", "NASDAQ-100 STOCK INDX", "NASDAQ-100 MINI", "NASDAQ 100"],
+     "Nasdaq 100 E-mini","equity",    "tff"),
+    (["E-MINI RUSSELL 2000", "RUSSELL 2000 MINI", "RUSSELL 2000 STOCK"],
+     "Russell 2000",     "equity",    "tff"),
+    (["CBOE VIX FUTURES", "CBOE VOLATILITY INDEX", "VOLATILITY S&P 500", "VIX FUTURES"],
+     "VIX Futures",      "equity",    "tff"),
+    # ── Rates (TFF) ──────────────────────────────────────────────────────────
+    (["2-YEAR U.S. TREASURY", "2-YEAR T-NOTES", "2 YEAR T-NOTE"],
+     "2Y T-Note",        "rates",     "tff"),
+    (["10-YEAR U.S. TREASURY", "10-YEAR T-NOTES", "10 YEAR T-NOTE"],
+     "10Y T-Note",       "rates",     "tff"),
+    (["30-YEAR U.S. TREASURY", "30-YEAR T-BONDS", "U.S. TREASURY BONDS"],
+     "30Y T-Bond",       "rates",     "tff"),
+    # ── FX (TFF) ─────────────────────────────────────────────────────────────
+    (["U.S. DOLLAR INDEX", "USD INDEX", "US DOLLAR INDEX"],
+     "USD Index",        "fx",        "tff"),
+    # ── Commodity (disagg) ───────────────────────────────────────────────────
+    (["GOLD - COMMODITY", "GOLD - COMEX"],
+     "Gold",             "commodity", "disagg"),
+    (["CRUDE OIL, LIGHT SWEET", "WTI CRUDE", "LIGHT SWEET CRUDE"],
+     "WTI Crude",        "commodity", "disagg"),
+    (["SILVER - COMMODITY", "SILVER - COMEX"],
+     "Silver",           "commodity", "disagg"),
+    (["NATURAL GAS - NYMEX", "NAT GAS NYMEX", "NATURAL GAS NYME"],
+     "Natural Gas",      "commodity", "disagg"),
 ]
 
 # Long/short column names keyed by report type
@@ -112,12 +135,22 @@ CS = {
 }
 
 CONTRACT_COLORS = {
+    # Equity
     "S&P 500 E-mini":   CS["blue"],
     "Nasdaq 100 E-mini":CS["purple"],
+    "Russell 2000":     CS["teal"],
     "VIX Futures":      CS["pink"],
+    # Rates
+    "2Y T-Note":        CS["green"],
     "10Y T-Note":       CS["amber"],
+    "30Y T-Bond":       CS["red"],
+    # FX
+    "USD Index":        CS["blue"],
+    # Commodity
     "Gold":             CS["amber"],
+    "Silver":           CS["text"],
     "WTI Crude":        CS["teal"],
+    "Natural Gas":      CS["purple"],
 }
 
 
@@ -203,6 +236,16 @@ def _load_cot_zip(report_type: str, years: list[int]) -> pd.DataFrame | None:
                     df.columns = [c.strip() for c in df.columns]
                     log.info(f"CFTC {report_type} {year}: {len(df)} rows, "
                              f"sample cols: {list(df.columns[:6])}")
+                    # Log unique market names so we can verify/fix fragments
+                    name_col = next(
+                        (c for c in df.columns
+                         if "market" in c.lower() and "exchange" in c.lower()), None
+                    )
+                    if name_col:
+                        names = sorted(df[name_col].dropna().unique())
+                        log.info(f"CFTC {report_type} markets ({len(names)}):")
+                        for n in names:
+                            log.info(f"  | {n}")
                     return df
         except Exception as e:
             log.warning(f"CFTC {report_type} {year} failed: {e}")
@@ -247,14 +290,22 @@ def _parse_cot_df(
     df = df.dropna(subset=["_date"])
 
     rows: list[dict] = []
-    for frag, label, group in contracts:
-        mask   = df[name_col].str.upper().str.contains(frag.upper(), na=False)
-        subset = (df[mask].sort_values("_date")
-                          .drop_duplicates("_date", keep="last"))
+    for frags, label, group in contracts:
+        # Try each fragment alternative until one matches rows in this file
+        subset = pd.DataFrame()
+        matched_frag = None
+        for frag in frags:
+            mask = df[name_col].str.upper().str.contains(frag.upper(), na=False)
+            candidate = (df[mask].sort_values("_date")
+                                 .drop_duplicates("_date", keep="last"))
+            if not candidate.empty:
+                subset = candidate
+                matched_frag = frag
+                break
         if subset.empty:
-            log.warning(f"No COT rows for '{frag}'")
+            log.warning(f"No COT rows for '{label}' (tried: {frags})")
             continue
-        log.info(f"  '{label}': {len(subset)} weekly rows")
+        log.info(f"  '{label}' matched via '{matched_frag}': {len(subset)} weekly rows")
         for _, row in subset.iterrows():
             try:
                 longs  = float(row[lc])
@@ -296,8 +347,8 @@ def fetch_cot_data() -> pd.DataFrame:
             continue
         long_col, short_col = COT_COLS[report_type]
         contracts = [
-            (frag, label, group)
-            for frag, label, group, rt in COT_CONTRACTS
+            (frags, label, group)
+            for frags, label, group, rt in COT_CONTRACTS
             if rt == report_type
         ]
         all_rows.extend(_parse_cot_df(df, contracts, long_col, short_col))
@@ -409,14 +460,14 @@ def build_chart(cot_df: pd.DataFrame, aaii_df: pd.DataFrame) -> str:
 
     if not cot_df.empty:
         _plot_cot_panel(ax_eq, cot_df,
-                        ["S&P 500 E-mini", "Nasdaq 100 E-mini", "VIX Futures"],
-                        "Equity & VIX Futures — Leveraged Fund Net Position")
+                        ["S&P 500 E-mini", "Nasdaq 100 E-mini", "Russell 2000", "VIX Futures"],
+                        "Equity & VIX — Leveraged Fund Net Position")
         _plot_cot_panel(ax_cm, cot_df,
-                        ["Gold", "WTI Crude"],
-                        "Commodity Futures — Money Manager Net Position")
+                        ["Gold", "Silver", "WTI Crude", "Natural Gas"],
+                        "Commodity — Money Manager Net Position")
         _plot_cot_panel(ax_rt, cot_df,
-                        ["10Y T-Note"],
-                        "Rates Futures — Leveraged Fund Net Position")
+                        ["2Y T-Note", "10Y T-Note", "30Y T-Bond"],
+                        "Rates — Leveraged Fund Net Position")
     else:
         for ax, t in [(ax_eq, "Equity COT"), (ax_cm, "Commodity COT"), (ax_rt, "Rates COT")]:
             _dark_ax(ax, t)
@@ -515,7 +566,7 @@ def _cot_cards_html(cot_df: pd.DataFrame) -> str:
 
     report_labels = {"tff": "TFF · Leveraged Funds", "disagg": "Disagg · Money Manager"}
 
-    for frag, label, group, report_type in COT_CONTRACTS:
+    for frags, label, group, report_type in COT_CONTRACTS:
         sub = cot_df[cot_df["market"] == label].sort_values("date")
         if sub.empty:
             continue
