@@ -575,6 +575,31 @@ def _cot_cards_html(cot_df: pd.DataFrame) -> str:
         oi_s = _fmt_k(oi) if oi else "—"
         report_lbl = report_labels.get(report_type, "")
         as_of = cur["date"].strftime("%b %d")
+        net_c = "#16a34a" if net >= 0 else "#dc2626"
+
+        # Build range bar HTML separately to avoid nested f-string (Python 3.11 limit)
+        if pct_rank is not None:
+            left_pct  = bar_left // 2   # 0–100 as percentage of table width
+            low_s     = _fmt_k(low_52w)
+            high_s    = _fmt_k(high_52w)
+            range_bar_html = (
+                '<div style="margin-top:10px;">'
+                '<div style="font-size:10px;color:#94a3b8;margin-bottom:4px;font-weight:600;">'
+                f'52-WEEK RANGE &nbsp;&nbsp;'
+                f'<span style="color:#64748b;">Low: {low_s}</span>'
+                f'&nbsp;&nbsp;<span style="color:#64748b;">High: {high_s}</span>'
+                '</div>'
+                '<table cellpadding="0" cellspacing="0" style="width:100%;"><tr>'
+                f'<td style="width:{left_pct}%;background:#e2e8f0;height:10px;'
+                'border-radius:5px 0 0 5px;"></td>'
+                f'<td style="width:3px;background:{bias_c};height:14px;'
+                'vertical-align:middle;"></td>'
+                '<td style="background:#e2e8f0;height:10px;'
+                'border-radius:0 5px 5px 0;"></td>'
+                '</tr></table></div>'
+            )
+        else:
+            range_bar_html = ""
 
         cards += f"""
     <div style="border:1px solid #e2e8f0;border-radius:8px;margin:8px 16px;overflow:hidden;">
@@ -604,7 +629,7 @@ def _cot_cards_html(cot_df: pd.DataFrame) -> str:
               <div style="font-size:10px;color:#94a3b8;font-weight:600;
                           text-transform:uppercase;letter-spacing:0.5px;">Net</div>
               <div style="font-size:14px;font-weight:800;
-                          color:{'#16a34a' if net >= 0 else '#dc2626'};">{_fmt_k(net)}</div>
+                          color:{net_c};">{_fmt_k(net)}</div>
             </td>
             <td style="padding:4px 8px;width:25%;">
               <div style="font-size:10px;color:#94a3b8;font-weight:600;
@@ -643,26 +668,7 @@ def _cot_cards_html(cot_df: pd.DataFrame) -> str:
         </table>
 
         <!-- 52-week range bar -->
-        {''.join([f"""
-        <div style="margin-top:10px;">
-          <div style="font-size:10px;color:#94a3b8;margin-bottom:4px;font-weight:600;">
-            52-WEEK RANGE &nbsp;&nbsp;
-            <span style="color:#64748b;">Low: {_fmt_k(low_52w)}</span>
-            &nbsp;&nbsp;
-            <span style="color:#64748b;">High: {_fmt_k(high_52w)}</span>
-          </div>
-          <table cellpadding="0" cellspacing="0" style="width:100%;">
-            <tr>
-              <td style="width:{bar_left/2}%;background:#e2e8f0;height:10px;
-                         border-radius:5px 0 0 5px;"></td>
-              <td style="width:2px;background:{bias_c};height:14px;
-                         vertical-align:middle;"></td>
-              <td style="background:#e2e8f0;height:10px;
-                         border-radius:0 5px 5px 0;"></td>
-            </tr>
-          </table>
-        </div>"""])
-        if pct_rank is not None else ""}
+        {range_bar_html}
       </div>
     </div>"""
 
