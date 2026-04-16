@@ -159,15 +159,18 @@ def get_treasury_curves() -> dict[str, dict]:
 
 # ── Futures Term Structures ───────────────────────────────────────────────────
 
-def futures_symbols(prefix: str, ref_date: datetime, n: int = 12) -> list[tuple[list[str], str]]:
+def fetch_futures_curve(prefix: str, ref_date: datetime) -> dict[str, dict]:
     """
-    Generate n monthly futures contract symbols starting the month after ref_date.
-    Returns list of ([candidate_symbols], label) — multiple formats tried per month.
+    Build futures term structure curves (current, 1M ago, 1Y ago).
+    Generates candidate symbols in two formats, batch-downloads all at once,
+    and uses the first format that returns data for each month.
     """
-    # Exchange suffix map for known prefixes
     exchange = {"CL": "NYM", "BZ": "NYM"}.get(prefix, "")
-    results  = []
-    for i in range(1, n + 1):
+
+    month_info  = []   # [(label, [sym_fmt1, sym_fmt2])]
+    all_symbols = []
+
+    for i in range(1, 13):
         month = ref_date.month + i
         year  = ref_date.year
         while month > 12:
@@ -178,123 +181,140 @@ def futures_symbols(prefix: str, ref_date: datetime, n: int = 12) -> list[tuple[
         label = datetime(year, month, 1).strftime("%b %y")
 
         candidates = [
-            f"{prefix}{code}{yr2}=F",            # CLK26=F   (most common yfinance)
-            f"{prefix}{code}{yr2}.{exchange}",    # CLK26.NYM
-            f"{prefix}{code}{year}.{exchange}",   # CLK2026.NYM
+            f"{prefix}{code}{yr2}=F",          # CLK26=F
+            f"{prefix}{code}{yr2}.{exchange}",  # CLK26.NYM
         ]
-        results.append((candidates, label))
-    return results
-
-
-def _download_with_fallback(candidates: list[str], start: str, end: str) -> pd.Series:
-    """
-    Try each candidate symbol until one returns data. Returns a Close price series.
-    """
-    for sym in candidates:
-        try:
-            raw = yf.download(sym, start=start, end=end,
-                              auto_adjust=True, progress=False)
-            if raw.empty:
-                continue
-            s = raw["Close"].dropna() if "Close" in raw.columns else pd.Series(dtype=float)
-            if not s.empty:
-                log.info(f"  {sym}: {len(s)} rows")
-                return s
-        except Exception:
-            pass
-    return pd.Series(dtype=float)
-
-
-def fetch_futures_curve(prefix: str, ref_date: datetime) -> dict[str, dict]:
-    """
-    Build futures term structure curves (current, 1M ago, 1Y ago).
-    Tries multiple symbol formats per contract month for reliability.
-    """
-    symbols = futures_symbols(prefix, ref_date, n=12)
-    log.info(f"Fetching {prefix} futures term structure ({len(symbols)} months)...")
+        month_info.append((label, candidates))
+        all_symbols.extend(candidates)
 
     end_str   = ref_date.strftime("%Y-%m-%d")
     start_str = (ref_date - timedelta(days=400)).strftime("%Y-%m-%d")
+
+    log.info(f"Batch-downloading {len(all_symbols)} {prefix} futures symbols...")
+    try:
+        raw = yf.download(
+            all_symbols,
+            start=start_str,
+            end=end_str,
+            group_by="ticker",
+            auto_adjust=False,   # futures don't need adjustment
+            progress=False,
+            threads=True,
+        )
+    except Exception as e:
+        log.error(f"{prefix} batch download failed: {e}")
+        return {}
+
+    # Build a price cache: symbol -> pd.Series of Close prices
+    cache: dict[str, pd.Series] = {}
+    for sym in all_symbols:
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if sym in raw.columns.get_level_values(0):
+                    s = raw[sym]["Close"].dropna()
+                elif sym in raw.columns.get_level_values(1):
+                    s = raw.xs(sym, level=1, axis=1)["Close"].dropna()
+                else:
+                    continue
+            else:
+                s = raw["Close"].dropna()
+            if not s.empty:
+                cache[sym] = s
+        except Exception:
+            pass
+
+    log.info(f"{prefix}: {len(cache)}/{len(all_symbols)} symbols returned data")
 
     t_now = ref_date
     t_1m  = ref_date - timedelta(days=21)
     t_1y  = ref_date - timedelta(days=252)
 
+    def asof(s: pd.Series, dt: datetime) -> float | None:
+        try:
+            v = s.asof(dt)
+            return float(v) if v == v else None
+        except Exception:
+            return None
+
     curves: dict[str, dict] = {"current": {}, "1m_ago": {}, "1y_ago": {}}
-
-    for candidates, label in symbols:
-        series = _download_with_fallback(candidates, start_str, end_str)
-        if series.empty:
-            log.debug(f"  No data for {label} ({candidates[0]})")
+    for label, candidates in month_info:
+        series = next((cache[s] for s in candidates if s in cache), None)
+        if series is None:
             continue
-
-        def asof_price(s: pd.Series, dt: datetime) -> float | None:
-            try:
-                v = s.asof(dt)
-                return float(v) if v == v else None
-            except Exception:
-                return None
-
-        p_now = asof_price(series, t_now)
-        p_1m  = asof_price(series, t_1m)
-        p_1y  = asof_price(series, t_1y)
-
+        p_now = asof(series, t_now)
+        p_1m  = asof(series, t_1m)
+        p_1y  = asof(series, t_1y)
         if p_now: curves["current"][label] = p_now
         if p_1m:  curves["1m_ago"][label]  = p_1m
         if p_1y:  curves["1y_ago"][label]  = p_1y
 
-    log.info(f"{prefix} curve points — current:{len(curves['current'])} "
+    log.info(f"{prefix} curve — current:{len(curves['current'])} "
              f"1m:{len(curves['1m_ago'])} 1y:{len(curves['1y_ago'])}")
     return curves
 
 
 # ── VIX Term Structure ────────────────────────────────────────────────────────
 
-def get_vix_term_structure(prices: pd.DataFrame) -> dict[str, dict]:
+# Tenor labels and corresponding CBOE index symbols (shortest → longest)
+_VIX_TENORS = [
+    ("9D",   "VIX9D"),
+    ("30D",  "VIX"),
+    ("93D",  "VIX3M"),
+    ("186D", "VIX6M"),
+]
+
+
+def get_vix_term_structure() -> tuple[dict[str, dict], pd.Series | None]:
     """
-    Build VIX term structure.
-    Uses ^VIX (30d), ^VIX3M (93d) where available.
-    If ^VIX3M is missing, downloads it separately.
-    Samples current, 1M ago, and 1Y ago from historical data.
+    Build VIX implied-volatility term structure using vix_utils, which pulls
+    VIX9D / VIX / VIX3M / VIX6M directly from CBOE's CDN — more reliable
+    than yfinance for these indices.
+
+    Returns
+    -------
+    curves : dict  {current/1m_ago/1y_ago -> {tenor_label -> float}}
+    vix3m  : pd.Series or None  — daily VIX3M close history, used to
+             supplement ^VIX3M for the regime signal if yfinance missed it.
     """
-    curves: dict[str, dict] = {"current": {}, "1m_ago": {}, "1y_ago": {}}
+    try:
+        from vix_utils import get_vix_index_histories
 
-    # Try to get ^VIX3M if not already in prices
-    vix3m_series = None
-    if "^VIX3M" not in prices.columns or prices["^VIX3M"].dropna().empty:
-        log.info("^VIX3M not in main download — fetching separately...")
-        try:
-            end   = datetime.today()
-            start = end - timedelta(days=400)
-            raw   = yf.download("^VIX3M", start=start.strftime("%Y-%m-%d"),
-                                end=end.strftime("%Y-%m-%d"),
-                                auto_adjust=True, progress=False)
-            if not raw.empty and "Close" in raw.columns:
-                vix3m_series = raw["Close"].dropna()
-                log.info(f"^VIX3M: {len(vix3m_series)} rows")
-        except Exception as e:
-            log.warning(f"^VIX3M fetch failed: {e}")
-    else:
-        vix3m_series = prices["^VIX3M"].dropna()
+        log.info("Downloading VIX index histories from CBOE via vix_utils...")
+        df = get_vix_index_histories()
+        df["Trade Date"] = pd.to_datetime(df["Trade Date"])
 
-    tenor_map = [
-        ("30d (VIX)",   prices.get("^VIX", pd.Series(dtype=float)).dropna()),
-        ("93d (VIX3M)", vix3m_series if vix3m_series is not None else pd.Series(dtype=float)),
-    ]
+        want = {sym for _, sym in _VIX_TENORS}
+        pivot = (
+            df[df["Symbol"].isin(want)]
+            .pivot_table(index="Trade Date", columns="Symbol", values="Close")
+            .sort_index()
+        )
+        pivot.index = pivot.index.tz_localize(None)
 
-    for label, s in tenor_map:
-        if s is None or s.empty:
-            log.warning(f"No data for {label}")
-            continue
-        n = len(s)
-        curves["current"][label] = float(s.iloc[-1])
-        if n >= 21:
-            curves["1m_ago"][label]  = float(s.iloc[-21])
-        if n >= 252:
-            curves["1y_ago"][label]  = float(s.iloc[-252])
+        today = datetime.today()
+        snapshots = {
+            "current": today,
+            "1m_ago":  today - timedelta(days=21),
+            "1y_ago":  today - timedelta(days=252),
+        }
 
-    log.info(f"VIX curve points — {list(curves['current'].keys())}")
-    return curves
+        curves: dict[str, dict] = {"current": {}, "1m_ago": {}, "1y_ago": {}}
+        for snap_key, snap_dt in snapshots.items():
+            for label, sym in _VIX_TENORS:
+                if sym not in pivot.columns:
+                    continue
+                val = pivot[sym].dropna().asof(snap_dt)
+                if val is not None and not np.isnan(float(val)):
+                    curves[snap_key][label] = float(val)
+
+        log.info(f"VIX term structure (CBOE): {list(curves['current'].keys())}")
+
+        vix3m = pivot["VIX3M"].dropna() if "VIX3M" in pivot.columns else None
+        return curves, vix3m
+
+    except Exception as e:
+        log.warning(f"vix_utils failed ({e}) — VIX chart will be empty")
+        return {"current": {}, "1m_ago": {}, "1y_ago": {}}, None
 
 
 # ── Regime Signals ────────────────────────────────────────────────────────────
@@ -422,7 +442,7 @@ def plot_treasury(ax, curves: dict[str, dict]) -> None:
 
 
 def plot_vix(ax, curves: dict[str, dict]) -> None:
-    labels_order = ["30d (VIX)", "93d (VIX3M)"]
+    labels_order = [lbl for lbl, _ in _VIX_TENORS]  # ["9D", "30D", "93D", "186D"]
     for key, color, lbl, ls in [
         ("current", CHART_STYLE["current"],   "Current", "-"),
         ("1m_ago",  CHART_STYLE["one_month"], "1M Ago",  "--"),
@@ -708,7 +728,7 @@ def build_email_html(signals: dict, chart_b64: str, treasury: dict) -> str:
         Generated by <strong style="color:#60a5fa;">Swarm Investments Quant Workflow</strong>
       </p>
       <p style="margin:0;color:#334155;font-size:10px;">
-        Data: Yahoo Finance + US Treasury &middot; {today}
+        Data: Yahoo Finance, CBOE (vix_utils), US Treasury &middot; {today}
       </p>
     </td>
   </tr>
@@ -779,12 +799,23 @@ def main() -> None:
             pass
     prices_df = pd.DataFrame(prices)
 
-    # 3. Regime signals
+    # 3. VIX term structure (CBOE via vix_utils)
+    #    Also returns VIX3M history used to patch prices_df if yfinance missed it
+    vix_curves, cboe_vix3m = get_vix_term_structure()
+
+    # Supplement ^VIX3M in prices_df from CBOE data if yfinance didn't return it
+    if cboe_vix3m is not None and (
+        "^VIX3M" not in prices_df.columns or prices_df["^VIX3M"].dropna().empty
+    ):
+        try:
+            prices_df["^VIX3M"] = cboe_vix3m.reindex(prices_df.index, method="ffill")
+            log.info("^VIX3M supplemented from CBOE data for regime signal")
+        except Exception as e:
+            log.warning(f"Could not reindex CBOE VIX3M: {e}")
+
+    # 4. Regime signals
     signals = calc_regime(prices_df, treasury)
     log.info(f"Regime: {signals.get('regime')} (score: {signals.get('score', 0):+.2f})")
-
-    # 4. VIX term structure
-    vix_curves = get_vix_term_structure(prices_df)
 
     # 5. Crude futures curves
     log.info("Fetching WTI futures curve...")
