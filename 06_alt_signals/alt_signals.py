@@ -266,6 +266,8 @@ def _parse_cot_df(
                     "date":     row["_date"],
                     "market":   label,
                     "group":    group,
+                    "longs":    longs,
+                    "shorts":   shorts,
                     "net":      net,
                     "pct_long": pct_l,
                     "oi":       oi,
@@ -489,57 +491,182 @@ _TABLE_HEADER = """
       </tr>"""
 
 
-def _cot_table_rows(cot_df: pd.DataFrame) -> str:
+def _fmt_k(v: float) -> str:
+    """Format a contract count as ±NNNk or ±N.Nm."""
+    sign = "+" if v >= 0 else ""
+    if abs(v) >= 1_000_000:
+        return f"{sign}{v/1_000_000:.2f}m"
+    return f"{sign}{v/1_000:.1f}k"
+
+
+def _cot_cards_html(cot_df: pd.DataFrame) -> str:
+    """
+    Render one detail card per COT contract showing:
+      - Gross longs / shorts / net / week-over-week change
+      - Open interest + net as % of OI
+      - 52-week percentile rank of net position
+      - 52-week range bar with current position marker
+    """
     if cot_df.empty:
-        return '<tr><td colspan="4" style="padding:16px;text-align:center;color:#94a3b8;font-size:12px;">COT data unavailable</td></tr>'
+        return '<p style="padding:16px;color:#94a3b8;font-size:12px;">COT data unavailable</p>'
 
-    latest = cot_df["date"].max()
-    rows   = ""
+    cutoff_52w = cot_df["date"].max() - timedelta(weeks=52)
+    cards = ""
 
-    for _, label, _, __ in COT_CONTRACTS:
+    report_labels = {"tff": "TFF · Leveraged Funds", "disagg": "Disagg · Money Manager"}
+
+    for frag, label, group, report_type in COT_CONTRACTS:
         sub = cot_df[cot_df["market"] == label].sort_values("date")
         if sub.empty:
             continue
 
-        cur = sub[sub["date"] == latest]
-        if cur.empty:
-            # Use most recent available date for this contract
-            cur = sub.tail(1)
+        cur  = sub.tail(1).iloc[0]
+        prev = sub.iloc[-2] if len(sub) >= 2 else None
 
-        net   = float(cur["net"].iloc[0])
-        pct_l = float(cur["pct_long"].iloc[0])
-        net_k = net / 1_000
+        net    = float(cur["net"])
+        longs  = float(cur["longs"])
+        shorts = float(cur["shorts"])
+        oi     = float(cur["oi"]) if not np.isnan(cur["oi"]) else None
+        pct_l  = float(cur["pct_long"])
 
-        # Week-over-week change
-        prev = sub[sub["date"] < cur["date"].iloc[0]].tail(1)
-        if not prev.empty:
-            delta   = net - float(prev["net"].iloc[0])
-            delta_k = delta / 1_000
+        # Week-over-week delta
+        if prev is not None:
+            delta   = net - float(prev["net"])
             dc      = "#16a34a" if delta >= 0 else "#dc2626"
-            delta_s = f'{"+" if delta >= 0 else ""}{delta_k:.1f}k'
+            delta_s = _fmt_k(delta)
         else:
-            delta_s, dc = "—", "#94a3b8"
+            delta, dc, delta_s = 0.0, "#94a3b8", "—"
 
-        # Bias label + positioning bar (100px wide)
+        # Net as % of open interest
+        net_oi_s = f"{net / oi * 100:+.1f}%" if oi and oi > 0 else "—"
+
+        # 52-week percentile and range
+        hist = sub[sub["date"] >= cutoff_52w]["net"]
+        if len(hist) >= 4:
+            pct_rank  = int((hist <= net).mean() * 100)
+            low_52w   = float(hist.min())
+            high_52w  = float(hist.max())
+            rng       = high_52w - low_52w
+            # Position of current value in the range (0–200 px bar)
+            bar_pos   = int(max(0, min(200, (net - low_52w) / rng * 200)) if rng > 0 else 100)
+            bar_left  = bar_pos
+            bar_right = 200 - bar_pos
+        else:
+            pct_rank = low_52w = high_52w = None
+            bar_left = bar_right = 100
+
+        # Bias
         bias   = "LONG" if pct_l > 55 else ("SHORT" if pct_l < 45 else "NEUTRAL")
-        bias_c = "#16a34a" if bias == "LONG" else ("#dc2626" if bias == "SHORT" else "#94a3b8")
-        bar_w  = max(2, min(100, int(pct_l)))
+        bias_c = "#16a34a" if bias == "LONG" else ("#dc2626" if bias == "SHORT" else "#64748b")
+        bias_bg = "#dcfce7" if bias == "LONG" else ("#fee2e2" if bias == "SHORT" else "#f1f5f9")
 
-        rows += f"""
-      <tr style="border-bottom:1px solid #f1f5f9;">
-        <td style="padding:9px 12px;font-size:12px;color:#0f172a;font-weight:600;">{label}</td>
-        <td style="padding:9px 10px;text-align:right;font-size:12px;color:#0f172a;font-weight:700;">{net_k:+.1f}k</td>
-        <td style="padding:9px 10px;text-align:right;font-size:12px;color:{dc};font-weight:600;">{delta_s}</td>
-        <td style="padding:9px 12px;">
-          <div style="display:inline-block;vertical-align:middle;
-               background:#e2e8f0;border-radius:3px;height:8px;width:100px;">
-            <div style="background:{bias_c};width:{bar_w}px;height:8px;border-radius:3px;"></div>
+        # Percentile badge colour: extremes are informative (contrarian signals)
+        if pct_rank is not None:
+            if pct_rank >= 80:
+                pct_c = "#dc2626"; pct_bg = "#fee2e2"  # extreme long = crowded
+            elif pct_rank <= 20:
+                pct_c = "#16a34a"; pct_bg = "#dcfce7"  # extreme short = potential squeeze
+            else:
+                pct_c = "#475569"; pct_bg = "#f1f5f9"
+            pct_s = f"{pct_rank}th pct"
+        else:
+            pct_c = "#94a3b8"; pct_bg = "#f8fafc"; pct_s = "—"
+
+        oi_s = _fmt_k(oi) if oi else "—"
+        report_lbl = report_labels.get(report_type, "")
+        as_of = cur["date"].strftime("%b %d")
+
+        cards += f"""
+    <div style="border:1px solid #e2e8f0;border-radius:8px;margin:8px 16px;overflow:hidden;">
+
+      <!-- Card header -->
+      <div style="background:#f8fafc;padding:10px 16px;
+                  border-bottom:1px solid #e2e8f0;
+                  display:table;width:100%;box-sizing:border-box;">
+        <div style="display:table-cell;vertical-align:middle;">
+          <span style="font-size:13px;font-weight:700;color:#0f172a;">{label}</span>
+          <span style="font-size:10px;color:#94a3b8;margin-left:8px;">{report_lbl} &middot; as of {as_of}</span>
+        </div>
+        <div style="display:table-cell;text-align:right;vertical-align:middle;">
+          <span style="background:{bias_bg};color:{bias_c};padding:3px 10px;
+                       border-radius:4px;font-size:11px;font-weight:700;">{bias}</span>
+          &nbsp;
+          <span style="background:{pct_bg};color:{pct_c};padding:3px 10px;
+                       border-radius:4px;font-size:11px;font-weight:700;">{pct_s}</span>
+        </div>
+      </div>
+
+      <!-- Stats grid -->
+      <div style="padding:12px 16px;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="padding:4px 8px 4px 0;width:25%;">
+              <div style="font-size:10px;color:#94a3b8;font-weight:600;
+                          text-transform:uppercase;letter-spacing:0.5px;">Net</div>
+              <div style="font-size:14px;font-weight:800;
+                          color:{'#16a34a' if net >= 0 else '#dc2626'};">{_fmt_k(net)}</div>
+            </td>
+            <td style="padding:4px 8px;width:25%;">
+              <div style="font-size:10px;color:#94a3b8;font-weight:600;
+                          text-transform:uppercase;letter-spacing:0.5px;">Wk Change</div>
+              <div style="font-size:14px;font-weight:800;color:{dc};">{delta_s}</div>
+            </td>
+            <td style="padding:4px 8px;width:25%;">
+              <div style="font-size:10px;color:#94a3b8;font-weight:600;
+                          text-transform:uppercase;letter-spacing:0.5px;">Gross Long</div>
+              <div style="font-size:14px;font-weight:700;color:#0f172a;">{_fmt_k(longs)}</div>
+            </td>
+            <td style="padding:4px 0 4px 8px;width:25%;">
+              <div style="font-size:10px;color:#94a3b8;font-weight:600;
+                          text-transform:uppercase;letter-spacing:0.5px;">Gross Short</div>
+              <div style="font-size:14px;font-weight:700;color:#0f172a;">{_fmt_k(shorts)}</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:8px 8px 4px 0;">
+              <div style="font-size:10px;color:#94a3b8;font-weight:600;
+                          text-transform:uppercase;letter-spacing:0.5px;">Open Interest</div>
+              <div style="font-size:12px;font-weight:600;color:#475569;">{oi_s}</div>
+            </td>
+            <td style="padding:8px 8px 4px 8px;">
+              <div style="font-size:10px;color:#94a3b8;font-weight:600;
+                          text-transform:uppercase;letter-spacing:0.5px;">Net / OI</div>
+              <div style="font-size:12px;font-weight:600;color:#475569;">{net_oi_s}</div>
+            </td>
+            <td colspan="2" style="padding:8px 0 4px 8px;">
+              <div style="font-size:10px;color:#94a3b8;font-weight:600;
+                          text-transform:uppercase;letter-spacing:0.5px;">
+                % Long of Gross (L+S)</div>
+              <div style="font-size:12px;font-weight:600;color:#475569;">{pct_l:.1f}%</div>
+            </td>
+          </tr>
+        </table>
+
+        <!-- 52-week range bar -->
+        {''.join([f"""
+        <div style="margin-top:10px;">
+          <div style="font-size:10px;color:#94a3b8;margin-bottom:4px;font-weight:600;">
+            52-WEEK RANGE &nbsp;&nbsp;
+            <span style="color:#64748b;">Low: {_fmt_k(low_52w)}</span>
+            &nbsp;&nbsp;
+            <span style="color:#64748b;">High: {_fmt_k(high_52w)}</span>
           </div>
-          <span style="margin-left:8px;font-size:11px;color:{bias_c};font-weight:700;">{bias}</span>
-        </td>
-      </tr>"""
+          <table cellpadding="0" cellspacing="0" style="width:100%;">
+            <tr>
+              <td style="width:{bar_left/2}%;background:#e2e8f0;height:10px;
+                         border-radius:5px 0 0 5px;"></td>
+              <td style="width:2px;background:{bias_c};height:14px;
+                         vertical-align:middle;"></td>
+              <td style="background:#e2e8f0;height:10px;
+                         border-radius:0 5px 5px 0;"></td>
+            </tr>
+          </table>
+        </div>"""])
+        if pct_rank is not None else ""}
+      </div>
+    </div>"""
 
-    return rows
+    return cards
 
 
 def build_email_html(
@@ -590,7 +717,7 @@ def build_email_html(
         if (vvix_v / vix_v) > 6:
             vvix_note = ' <span style="color:#ef4444;font-size:10px;font-weight:700;">ELEVATED</span>'
 
-    cot_rows_html = _cot_table_rows(cot_df)
+    cot_cards     = _cot_cards_html(cot_df)
     cot_date_str  = ""
     if not cot_df.empty:
         cot_date_str = f" — as of {cot_df['date'].max().strftime('%b %d, %Y')}"
@@ -679,19 +806,12 @@ def build_email_html(
     <td style="background:#fff;padding:0;border-top:1px solid #e2e8f0;">
       <div style="padding:16px 20px 8px;font-size:10px;font-weight:700;
           color:#64748b;text-transform:uppercase;letter-spacing:1px;">
-        CFTC Speculative Positioning — Net Non-Commercial Contracts{cot_date_str}</div>
-      <table width="100%" cellpadding="0" cellspacing="0">
-        <tr style="background:#f8fafc;border-bottom:2px solid #e2e8f0;">
-          <th style="padding:8px 12px;text-align:left;font-size:10px;color:#94a3b8;font-weight:600;">Futures Market</th>
-          <th style="padding:8px 10px;text-align:right;font-size:10px;color:#94a3b8;font-weight:600;">Net Position</th>
-          <th style="padding:8px 10px;text-align:right;font-size:10px;color:#94a3b8;font-weight:600;">Wk Change</th>
-          <th style="padding:8px 12px;font-size:10px;color:#94a3b8;font-weight:600;">Positioning Bias</th>
-        </tr>
-        {cot_rows_html}
-      </table>
-      <div style="padding:8px 20px 12px;font-size:10px;color:#94a3b8;">
-        Net = Non-Commercial Long − Short. Bar shows % of reportable positions held long.
-        &gt;55% = LONG bias, &lt;45% = SHORT bias.
+        CFTC Speculative Positioning{cot_date_str}</div>
+      {cot_cards}
+      <div style="padding:4px 24px 14px;font-size:10px;color:#94a3b8;">
+        Leveraged Funds (TFF) = hedge funds &amp; CTAs &middot;
+        Money Manager (Disagg) = hedge funds &amp; CTAs in commodity markets &middot;
+        Percentile rank over trailing 52 weeks: &ge;80th = crowded long, &le;20th = crowded short.
       </div>
     </td>
   </tr>
