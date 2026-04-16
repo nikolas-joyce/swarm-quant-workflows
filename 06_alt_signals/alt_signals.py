@@ -502,6 +502,204 @@ def build_chart(cot_df: pd.DataFrame, aaii_df: pd.DataFrame) -> str:
     return base64.b64encode(buf.read()).decode()
 
 
+# ── COT overlay chart ─────────────────────────────────────────────────────────
+
+# Map COT contract label → yfinance price ticker for the overlay chart
+COT_PRICE_MAP = {
+    "S&P 500 E-mini":   "SPY",
+    "Nasdaq 100 E-mini":"QQQ",
+    "Russell 2000":     "IWM",
+    "VIX Futures":      "^VIX",
+    "2Y T-Note":        "^IRX",
+    "10Y T-Note":       "^TNX",
+    "30Y T-Bond":       "^TYX",
+    "USD Index":        "UUP",
+    "Gold":             "GLD",
+    "Silver":           "SLV",
+    "WTI Crude":        "USO",
+    "Natural Gas":      "UNG",
+}
+
+# Contracts to show in the overlay chart (most market-relevant)
+OVERLAY_CONTRACTS = [
+    "S&P 500 E-mini",
+    "10Y T-Note",
+    "Gold",
+    "WTI Crude",
+    "VIX Futures",
+    "USD Index",
+]
+
+
+def build_cot_overlay_chart(cot_df: pd.DataFrame, prices: pd.DataFrame) -> str:
+    """
+    For each featured contract, plot two stacked panels:
+      Top (65%): underlying price history.  Background shaded green when
+                 COT net was ≤20th-pct (crowded short) and red when ≥80th-pct
+                 (crowded long).  Current shading state annotated.
+      Bottom (35%): COT net position with rolling 20th/80th-pct threshold
+                    lines and a highlighted dot for the current week.
+
+    Uses a 2-year lookback; COT history is resampled to weekly (Friday).
+    """
+    # Only show contracts that have both COT and price data
+    available = [
+        c for c in OVERLAY_CONTRACTS
+        if not cot_df.empty
+        and c in cot_df["market"].values
+        and COT_PRICE_MAP.get(c) in prices.columns
+    ]
+    if not available:
+        # Return a tiny blank chart rather than crashing
+        fig, ax = plt.subplots(figsize=(14, 2), facecolor=CS["bg"])
+        ax.set_facecolor(CS["bg"])
+        ax.text(0.5, 0.5, "No overlay data available",
+                transform=ax.transAxes, ha="center", va="center",
+                color=CS["text"], fontsize=10)
+        ax.axis("off")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight",
+                    facecolor=CS["bg"])
+        buf.seek(0)
+        plt.close(fig)
+        return base64.b64encode(buf.read()).decode()
+
+    n_cols  = min(3, len(available))
+    n_rows  = ((len(available) - 1) // n_cols + 1) * 2   # 2 sub-rows per contract
+    fig_h   = n_rows * 2.2
+
+    fig = plt.figure(figsize=(14, fig_h), facecolor=CS["bg"])
+    fig.suptitle(
+        "COT Extreme Positioning vs Underlying Price — 2-Year View",
+        color="#f1f5f9", fontsize=12, fontweight="bold", y=1.01,
+    )
+
+    cutoff_2y = datetime.today() - timedelta(days=730)
+
+    for idx, contract in enumerate(available):
+        col_i = idx % n_cols
+        row_i = (idx // n_cols) * 2          # each contract occupies 2 sub-rows
+
+        # GridSpec position: price panel (tall) and COT panel (short)
+        ax_price = fig.add_subplot(n_rows, n_cols, row_i * n_cols + col_i + 1)
+        ax_cot   = fig.add_subplot(n_rows, n_cols, (row_i + 1) * n_cols + col_i + 1)
+
+        ticker = COT_PRICE_MAP[contract]
+        color  = CONTRACT_COLORS.get(contract, CS["blue"])
+
+        # ── COT data ──────────────────────────────────────────────────────────
+        cot_sub = (cot_df[cot_df["market"] == contract]
+                   .sort_values("date")
+                   .set_index("date"))
+        cot_sub = cot_sub[cot_sub.index >= cutoff_2y]
+
+        # Rolling 52-week percentile thresholds
+        net_series = cot_sub["net"]
+        roll_80 = net_series.rolling(52, min_periods=10).quantile(0.80)
+        roll_20 = net_series.rolling(52, min_periods=10).quantile(0.20)
+
+        # Boolean masks for extreme zones
+        is_crowded_long  = net_series >= roll_80
+        is_crowded_short = net_series <= roll_20
+
+        # ── Price data ────────────────────────────────────────────────────────
+        price_s = prices[ticker].dropna()
+        price_s = price_s[price_s.index >= cutoff_2y]
+        # Resample to weekly (Friday) to align with COT
+        price_w = price_s.resample("W-FRI").last().dropna()
+
+        # ── Top panel: price + shading ────────────────────────────────────────
+        ax_price.set_facecolor(CS["panel"])
+        ax_price.tick_params(colors=CS["text"], labelsize=6)
+        for sp in ax_price.spines.values():
+            sp.set_edgecolor(CS["grid"])
+        ax_price.grid(True, color=CS["grid"], linewidth=0.4, alpha=0.5)
+
+        if not price_w.empty:
+            ax_price.plot(price_w.index, price_w.values,
+                          color=color, linewidth=1.4, zorder=3)
+
+            # Shade price chart where COT was extreme
+            # Align price and cot on common weekly dates
+            common = price_w.index.intersection(cot_sub.index)
+            for dt in common:
+                if is_crowded_short.get(dt, False):
+                    ax_price.axvspan(dt - timedelta(days=3), dt + timedelta(days=3),
+                                     alpha=0.25, color=CS["green"], zorder=1)
+                elif is_crowded_long.get(dt, False):
+                    ax_price.axvspan(dt - timedelta(days=3), dt + timedelta(days=3),
+                                     alpha=0.25, color=CS["red"], zorder=1)
+
+        # Annotate current state
+        cur_net = float(net_series.iloc[-1]) if not net_series.empty else None
+        cur_80  = float(roll_80.iloc[-1])    if not roll_80.empty else None
+        cur_20  = float(roll_20.iloc[-1])    if not roll_20.empty else None
+        if cur_net is not None and cur_80 is not None and cur_20 is not None:
+            if cur_net >= cur_80:
+                state, state_c = "CROWDED LONG", CS["red"]
+            elif cur_net <= cur_20:
+                state, state_c = "CROWDED SHORT", CS["green"]
+            else:
+                state, state_c = "NEUTRAL", CS["text"]
+        else:
+            state, state_c = "", CS["text"]
+
+        title_txt = contract
+        ax_price.set_title(title_txt, color="#f1f5f9", fontsize=8,
+                           fontweight="bold", pad=4)
+        if state:
+            ax_price.text(0.99, 0.97, state,
+                          transform=ax_price.transAxes,
+                          ha="right", va="top", fontsize=6.5,
+                          color=state_c, fontweight="bold")
+        ax_price.set_ylabel(ticker, color=CS["text"], fontsize=6)
+        ax_price.tick_params(labelbottom=False)
+
+        # ── Bottom panel: COT net + thresholds ───────────────────────────────
+        ax_cot.set_facecolor(CS["panel"])
+        ax_cot.tick_params(colors=CS["text"], labelsize=6)
+        for sp in ax_cot.spines.values():
+            sp.set_edgecolor(CS["grid"])
+        ax_cot.grid(True, color=CS["grid"], linewidth=0.4, alpha=0.5)
+        ax_cot.axhline(0, color=CS["text"], linewidth=0.6, alpha=0.4)
+
+        if not net_series.empty:
+            net_k = net_series / 1_000
+            ax_cot.plot(net_series.index, net_k, color=color,
+                        linewidth=1.2, zorder=3)
+            ax_cot.fill_between(net_series.index, net_k, 0,
+                                where=(net_k >= 0), alpha=0.10, color=CS["green"])
+            ax_cot.fill_between(net_series.index, net_k, 0,
+                                where=(net_k < 0),  alpha=0.10, color=CS["red"])
+
+            # Rolling threshold lines
+            ax_cot.plot(roll_80.index, roll_80 / 1_000,
+                        color=CS["red"], linewidth=0.8,
+                        linestyle="--", alpha=0.7, label="80th pct")
+            ax_cot.plot(roll_20.index, roll_20 / 1_000,
+                        color=CS["green"], linewidth=0.8,
+                        linestyle="--", alpha=0.7, label="20th pct")
+
+            # Current level dot
+            if cur_net is not None:
+                ax_cot.scatter([net_series.index[-1]], [cur_net / 1_000],
+                               color=state_c, s=30, zorder=5)
+
+        ax_cot.set_ylabel("Net (000s)", color=CS["text"], fontsize=6)
+        ax_cot.legend(fontsize=5, facecolor=CS["panel"],
+                      labelcolor=CS["text"], framealpha=0.7,
+                      loc="lower left")
+
+    fig.tight_layout(pad=1.2)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return base64.b64encode(buf.read()).decode()
+
+
 # ── Email HTML ────────────────────────────────────────────────────────────────
 
 def _ret_cell(v: float | None) -> str:
@@ -733,6 +931,7 @@ def build_email_html(
     aaii_df:        pd.DataFrame,
     sentiment:      dict,
     chart_b64:      str,
+    overlay_b64:    str = "",
 ) -> str:
     today = datetime.now().strftime("%B %d, %Y")
 
@@ -778,6 +977,23 @@ def build_email_html(
     cot_date_str  = ""
     if not cot_df.empty:
         cot_date_str = f" — as of {cot_df['date'].max().strftime('%b %d, %Y')}"
+
+    if overlay_b64:
+        overlay_section = (
+            '<tr><td style="background:#fff;padding:20px;border-top:1px solid #e2e8f0;">'
+            '<div style="font-size:10px;font-weight:700;color:#64748b;'
+            'text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">'
+            'COT Positioning Overlay — Price History &amp; Extreme Zones</div>'
+            '<img src="data:image/png;base64,' + overlay_b64 + '"'
+            ' style="width:100%;max-width:720px;border-radius:8px;"'
+            ' alt="COT Overlay Charts">'
+            '<div style="padding:6px 0 0;font-size:10px;color:#94a3b8;">'
+            'Green shading = COT net &le;20th pct (crowded short / potential squeeze) &middot; '
+            'Red shading = COT net &ge;80th pct (crowded long / contrarian warning)</div>'
+            '</td></tr>'
+        )
+    else:
+        overlay_section = ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -899,6 +1115,9 @@ def build_email_html(
     </td>
   </tr>
 
+  <!-- COT Overlay Charts -->
+  {overlay_section}
+
   <!-- Footer -->
   <tr>
     <td style="background:#0f172a;padding:20px 32px;border-radius:8px;
@@ -976,9 +1195,14 @@ def main() -> None:
     # 5. AAII sentiment (FRED)
     aaii_df = fetch_aaii_sentiment()
 
-    # 6. Build chart
+    # 6. Build charts
     log.info("Rendering charts...")
-    chart_b64 = build_chart(cot_df, aaii_df)
+    chart_b64   = build_chart(cot_df, aaii_df)
+
+    # Fetch price history needed for COT overlay (2 years of weekly data)
+    overlay_tickers = list(COT_PRICE_MAP.values())
+    overlay_prices  = fetch_price_data(overlay_tickers, days=730)
+    overlay_b64 = build_cot_overlay_chart(cot_df, overlay_prices)
 
     # 7. Build & send email
     html = build_email_html(
@@ -988,6 +1212,7 @@ def main() -> None:
         aaii_df=aaii_df,
         sentiment=sentiment,
         chart_b64=chart_b64,
+        overlay_b64=overlay_b64,
     )
     log.info("Sending email...")
     service = get_gmail_service()
