@@ -75,14 +75,26 @@ BENCHMARK = "SPY"
 # Sentiment tickers from yfinance
 SENTIMENT_TICKERS = ["^VIX", "^VVIX", "^SKEW"]
 
-# CFTC Legacy COT — partial market-name match → (display label, category)
+# CFTC base URL
+CFTC_BASE = "https://www.cftc.gov/files/dea/history"
+
+# COT contracts: (name_fragment, display_label, chart_group, report_type)
+#   report_type "tff"    → Traders in Financial Futures, column = Lev_Money (hedge funds/CTAs)
+#   report_type "disagg" → Disaggregated Futures,        column = M_Money   (money managers)
 COT_CONTRACTS = [
-    ("E-MINI S&P 500",             "S&P 500 E-mini",  "equity"),
-    ("NASDAQ-100 STOCK INDEX",     "Nasdaq 100 E-mini","equity"),
-    ("10-YEAR U.S. TREASURY",      "10Y T-Note",       "rates"),
-    ("GOLD - COMMODITY",           "Gold",             "commodity"),
-    ("CRUDE OIL, LIGHT SWEET",     "WTI Crude",        "commodity"),
+    ("E-MINI S&P 500",         "S&P 500 E-mini",   "equity",    "tff"),
+    ("NASDAQ-100 STOCK INDEX", "Nasdaq 100 E-mini", "equity",    "tff"),
+    ("CBOE VIX",               "VIX Futures",       "equity",    "tff"),
+    ("10-YEAR U.S. TREASURY",  "10Y T-Note",        "rates",     "tff"),
+    ("GOLD - COMMODITY",       "Gold",              "commodity", "disagg"),
+    ("CRUDE OIL, LIGHT SWEET", "WTI Crude",         "commodity", "disagg"),
 ]
+
+# Long/short column names keyed by report type
+COT_COLS = {
+    "tff":    ("Lev_Money_Positions_Long_All",  "Lev_Money_Positions_Short_All"),
+    "disagg": ("M_Money_Positions_Long_All",    "M_Money_Positions_Short_All"),
+}
 
 # Chart colour palette
 CS = {
@@ -96,11 +108,13 @@ CS = {
     "amber":  "#f59e0b",
     "purple": "#a78bfa",
     "teal":   "#2dd4bf",
+    "pink":   "#f472b6",
 }
 
 CONTRACT_COLORS = {
     "S&P 500 E-mini":   CS["blue"],
     "Nasdaq 100 E-mini":CS["purple"],
+    "VIX Futures":      CS["pink"],
     "10Y T-Note":       CS["amber"],
     "Gold":             CS["amber"],
     "WTI Crude":        CS["teal"],
@@ -164,111 +178,135 @@ def calc_returns(prices: pd.DataFrame, ticker: str) -> dict:
 
 # ── CFTC COT data ─────────────────────────────────────────────────────────────
 
-def fetch_cot_data() -> pd.DataFrame:
+def _load_cot_zip(report_type: str, years: list[int]) -> pd.DataFrame | None:
     """
-    Download CFTC Legacy financial-futures COT zip files for the current
-    and prior year, parse net non-commercial (speculative) positioning,
-    and return a tidy DataFrame with columns:
-        date, market, net, pct_long, oi
+    Download a CFTC COT zip for the given report type and try each year in order.
+    report_type: "tff"    → fut_fin_txt_{year}.zip    (Traders in Financial Futures)
+                 "disagg" → fut_disagg_txt_{year}.zip (Disaggregated Futures)
+    Returns the first successful DataFrame, or None.
     """
-    year = datetime.today().year
-    raw_frames: list[pd.DataFrame] = []
-
-    for y in [year, year - 1]:
-        url = f"https://www.cftc.gov/files/dea/history/fin_fut_cot_{y}.zip"
+    prefix = {"tff": "fut_fin_txt", "disagg": "fut_disagg_txt"}[report_type]
+    for year in years:
+        url = f"{CFTC_BASE}/{prefix}_{year}.zip"
         try:
-            log.info(f"Downloading CFTC COT {y}...")
+            log.info(f"Downloading CFTC {report_type} {year}: {url}")
             resp = requests.get(url, timeout=45)
             resp.raise_for_status()
             with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-                data_files = [
-                    n for n in z.namelist()
-                    if n.lower().endswith((".csv", ".txt"))
-                ]
+                data_files = [n for n in z.namelist()
+                              if n.lower().endswith((".csv", ".txt"))]
                 if not data_files:
-                    log.warning(f"No data file found in COT {y} zip")
+                    log.warning(f"No data file in {report_type} {year} zip")
                     continue
                 with z.open(data_files[0]) as f:
                     df = pd.read_csv(f, encoding="latin-1", low_memory=False)
                     df.columns = [c.strip() for c in df.columns]
-                    raw_frames.append(df)
-                    log.info(f"COT {y}: {len(df)} rows loaded")
+                    log.info(f"CFTC {report_type} {year}: {len(df)} rows, "
+                             f"sample cols: {list(df.columns[:6])}")
+                    return df
         except Exception as e:
-            log.warning(f"COT {y} download failed: {e}")
+            log.warning(f"CFTC {report_type} {year} failed: {e}")
+    return None
 
-    if not raw_frames:
-        log.warning("No CFTC COT data available")
-        return pd.DataFrame()
 
-    raw = pd.concat(raw_frames, ignore_index=True)
+def _parse_cot_df(
+    df: pd.DataFrame,
+    contracts: list[tuple],   # [(frag, label, group), ...]
+    long_col: str,
+    short_col: str,
+) -> list[dict]:
+    """Parse one CFTC report DataFrame into a list of row dicts."""
 
-    # ── Identify key columns ──────────────────────────────────────────────────
-    def find(fragments: list[str]) -> str | None:
-        for frag in fragments:
-            m = next((c for c in raw.columns if frag.lower() in c.lower()), None)
+    def find(frags: list[str]) -> str | None:
+        for f in frags:
+            m = next((c for c in df.columns if f.lower() in c.lower()), None)
             if m:
                 return m
         return None
 
-    name_col  = find(["Market_and_Exchange_Names", "Market and Exchange"])
-    date_col  = find(["Report_Date_as_MM_DD_YYYY", "As_of_Date_In_Form_YYMMDD",
-                       "As of Date in Form YYMMDD"])
-    long_col  = find(["NonComm_Positions_Long_All",  "Noncommercial Long"])
-    short_col = find(["NonComm_Positions_Short_All", "Noncommercial Short"])
-    oi_col    = find(["Open_Interest_All", "Open Interest"])
+    name_col = find(["Market_and_Exchange_Names", "Market and Exchange"])
+    date_col = find(["Report_Date_as_MM_DD_YYYY", "As_of_Date_In_Form_YYMMDD",
+                      "As of Date"])
+    lc       = find([long_col])
+    sc       = find([short_col])
+    oi_col   = find(["Open_Interest_All", "Open Interest"])
 
-    if not all([name_col, date_col, long_col, short_col]):
-        log.warning(f"Missing expected COT columns. Found: {list(raw.columns[:15])}")
-        return pd.DataFrame()
+    if not all([name_col, date_col, lc, sc]):
+        log.warning(f"Missing columns. long='{long_col}' short='{short_col}' "
+                    f"found cols: {list(df.columns[:15])}")
+        return []
 
-    # ── Parse dates ───────────────────────────────────────────────────────────
-    date_str = raw[date_col].astype(str).str.strip()
-    # Try MM/DD/YYYY first, then YYMMDD
-    raw["_date"] = pd.to_datetime(date_str, format="%m/%d/%Y", errors="coerce")
-    mask_bad = raw["_date"].isna()
-    raw.loc[mask_bad, "_date"] = pd.to_datetime(
-        date_str[mask_bad].str.zfill(6), format="%y%m%d", errors="coerce"
+    # Parse dates — try MM/DD/YYYY then YYMMDD
+    ds = df[date_col].astype(str).str.strip()
+    df = df.copy()
+    df["_date"] = pd.to_datetime(ds, format="%m/%d/%Y", errors="coerce")
+    bad = df["_date"].isna()
+    df.loc[bad, "_date"] = pd.to_datetime(
+        ds[bad].str.zfill(6), format="%y%m%d", errors="coerce"
     )
-    raw = raw.dropna(subset=["_date"])
+    df = df.dropna(subset=["_date"])
 
-    # ── Build output rows ─────────────────────────────────────────────────────
     rows: list[dict] = []
-    for frag, label, _ in COT_CONTRACTS:
-        mask   = raw[name_col].str.upper().str.contains(frag.upper(), na=False)
-        subset = (
-            raw[mask]
-            .sort_values("_date")
-            .drop_duplicates(subset=["_date"], keep="last")
-        )
+    for frag, label, group in contracts:
+        mask   = df[name_col].str.upper().str.contains(frag.upper(), na=False)
+        subset = (df[mask].sort_values("_date")
+                          .drop_duplicates("_date", keep="last"))
         if subset.empty:
-            log.warning(f"No COT rows matched '{frag}'")
+            log.warning(f"No COT rows for '{frag}'")
             continue
-
+        log.info(f"  '{label}': {len(subset)} weekly rows")
         for _, row in subset.iterrows():
             try:
-                longs  = float(row[long_col])
-                shorts = float(row[short_col])
+                longs  = float(row[lc])
+                shorts = float(row[sc])
                 oi     = float(row[oi_col]) if oi_col else np.nan
                 net    = longs - shorts
                 pct_l  = longs / (longs + shorts) * 100 if (longs + shorts) > 0 else 50.0
                 rows.append({
-                    "date":    row["_date"],
-                    "market":  label,
-                    "net":     net,
+                    "date":     row["_date"],
+                    "market":   label,
+                    "group":    group,
+                    "net":      net,
                     "pct_long": pct_l,
-                    "oi":      oi,
+                    "oi":       oi,
                 })
             except Exception:
                 pass
+    return rows
 
-    if not rows:
+
+def fetch_cot_data() -> pd.DataFrame:
+    """
+    Download two CFTC COT reports and parse speculative (hedge fund/CTA) positioning:
+      - Traders in Financial Futures (TFF): S&P 500, Nasdaq, VIX, 10Y T-Note
+        → uses Leveraged Funds columns (explicitly labeled hedge funds/CTAs)
+      - Disaggregated Futures: Gold, WTI Crude
+        → uses Money Manager columns (same hedge fund category for commodities)
+    Returns tidy DataFrame: date, market, group, net, pct_long, oi
+    """
+    year  = datetime.today().year
+    years = [year, year - 1]
+    all_rows: list[dict] = []
+
+    for report_type in ("tff", "disagg"):
+        df = _load_cot_zip(report_type, years)
+        if df is None:
+            continue
+        long_col, short_col = COT_COLS[report_type]
+        contracts = [
+            (frag, label, group)
+            for frag, label, group, rt in COT_CONTRACTS
+            if rt == report_type
+        ]
+        all_rows.extend(_parse_cot_df(df, contracts, long_col, short_col))
+
+    if not all_rows:
+        log.warning("No CFTC COT data parsed")
         return pd.DataFrame()
 
-    out = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
-    log.info(
-        f"COT data ready: {out['market'].nunique()} contracts, "
-        f"latest {out['date'].max().date()}"
-    )
+    out = pd.DataFrame(all_rows).sort_values("date").reset_index(drop=True)
+    log.info(f"COT ready: {out['market'].nunique()} contracts, "
+             f"latest {out['date'].max().date()}")
     return out
 
 
@@ -369,14 +407,14 @@ def build_chart(cot_df: pd.DataFrame, aaii_df: pd.DataFrame) -> str:
 
     if not cot_df.empty:
         _plot_cot_panel(ax_eq, cot_df,
-                        ["S&P 500 E-mini", "Nasdaq 100 E-mini"],
-                        "Equity Futures — Speculative Net Position")
+                        ["S&P 500 E-mini", "Nasdaq 100 E-mini", "VIX Futures"],
+                        "Equity & VIX Futures — Leveraged Fund Net Position")
         _plot_cot_panel(ax_cm, cot_df,
                         ["Gold", "WTI Crude"],
-                        "Commodity Futures — Speculative Net Position")
+                        "Commodity Futures — Money Manager Net Position")
         _plot_cot_panel(ax_rt, cot_df,
                         ["10Y T-Note"],
-                        "Rates Futures — Speculative Net Position")
+                        "Rates Futures — Leveraged Fund Net Position")
     else:
         for ax, t in [(ax_eq, "Equity COT"), (ax_cm, "Commodity COT"), (ax_rt, "Rates COT")]:
             _dark_ax(ax, t)
@@ -458,7 +496,7 @@ def _cot_table_rows(cot_df: pd.DataFrame) -> str:
     latest = cot_df["date"].max()
     rows   = ""
 
-    for _, label, _ in COT_CONTRACTS:
+    for _, label, _, __ in COT_CONTRACTS:
         sub = cot_df[cot_df["market"] == label].sort_values("date")
         if sub.empty:
             continue
