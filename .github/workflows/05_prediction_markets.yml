@@ -30,7 +30,7 @@ jobs:
       - name: Write Gmail token from secret
         env:
           GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
-        run: python3 -c "import os; open('token.json','w').write(os.environ['GMAIL_TOKEN_JSON'])"
+        run: python3 -c "import os; v=os.environ['GMAIL_TOKEN_JSON'].replace(chr(10),'').replace(chr(13),''); open('token.json','w').write(v)"
 
       - name: Run Prediction Market Monitor
         env:
