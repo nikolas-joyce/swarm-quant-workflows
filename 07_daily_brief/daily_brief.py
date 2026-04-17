@@ -268,7 +268,7 @@ def _md_to_html(text: str) -> str:
                 in_list = True
             out.append(
                 f'<li style="margin:5px 0;font-size:13px;color:#1e293b;'
-                f'line-height:1.6;">{content}</li>'
+                f'line-height:1.6;word-wrap:break-word;overflow-wrap:break-word;">{content}</li>'
             )
 
         elif s == "":
@@ -283,7 +283,7 @@ def _md_to_html(text: str) -> str:
             content = _bold(s)
             out.append(
                 f'<p style="margin:5px 0;font-size:13px;color:#374151;'
-                f'line-height:1.6;">{content}</p>'
+                f'line-height:1.6;word-wrap:break-word;overflow-wrap:break-word;">{content}</p>'
             )
 
     if in_list:
@@ -320,7 +320,7 @@ def build_email_html(emails: list[dict], brief_text: str) -> str:
      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;">
 <tr><td align="center" style="padding:24px 16px;">
-<table width="680" cellpadding="0" cellspacing="0">
+<table width="680" cellpadding="0" cellspacing="0" style="max-width:680px;width:100%;">
 
   <!-- Header -->
   <tr>
@@ -345,7 +345,8 @@ def build_email_html(emails: list[dict], brief_text: str) -> str:
 
   <!-- Brief body -->
   <tr>
-    <td style="background:#fff;padding:28px 36px;border-radius:0 0 12px 12px;">
+    <td style="background:#fff;padding:28px 36px;border-radius:0 0 12px 12px;
+        word-wrap:break-word;overflow-wrap:break-word;">
       {brief_html}
     </td>
   </tr>
