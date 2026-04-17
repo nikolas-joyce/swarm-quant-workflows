@@ -26,7 +26,10 @@ except ImportError:
     print("Run:  pip install -r requirements.txt")
     sys.exit(1)
 
-SCOPES     = ["https://www.googleapis.com/auth/gmail.send"]
+SCOPES     = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",   # needed by workflow #07
+]
 ROOT       = Path(__file__).parent.parent
 CREDS_PATH = ROOT / "credentials.json"
 TOKEN_PATH = ROOT / "token.json"

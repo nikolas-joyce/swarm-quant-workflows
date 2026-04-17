@@ -7,3 +7,4 @@ google-auth>=2.27.0
 google-auth-oauthlib>=1.2.0
 google-api-python-client>=2.120.0
 vix_utils>=0.1.7
+anthropic>=0.40.0

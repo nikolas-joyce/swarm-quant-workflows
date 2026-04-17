@@ -1,0 +1,42 @@
+name: 07 — Daily Market Brief
+
+on:
+  schedule:
+    # Mon–Fri at 7:00 AM Eastern (11:00 UTC, adjusts for DST automatically)
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Gmail token from secret
+        run: echo '${{ secrets.GMAIL_TOKEN_JSON }}' > token.json
+
+      - name: Run Daily Market Brief
+        env:
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          GMAIL_TOKEN_PATH: token.json
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python 07_daily_brief/daily_brief.py
+
+      - name: Clean up token file
+        if: always()
+        run: rm -f token.json
